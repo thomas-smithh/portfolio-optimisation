@@ -1,4 +1,5 @@
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
+from langchain_community.document_loaders import WikipediaLoader
 from langchain_core.messages import SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -65,18 +66,25 @@ class ResearchState(TypedDict):
     
 def tavily_search(
     search_query: str,
-    max_results: int = 5
+    max_results: int = 5,
+    deep: bool = True
 ) -> List[str]:
     """
     """
 
-    tavily_search = TavilySearchResults(max_results=max_results)
-    search_docs = tavily_search.invoke(search_query)
+    tavily_search = TavilySearch(max_results=max_results)
+    search_output = tavily_search.invoke(
+        {
+            "query": search_query,
+            "search_depth": "advanced" if deep else "basic",
+        }
+    )
 
+    docs = search_output.get("results", [])
     formatted_search_docs = "\n\n---\n\n".join(
         [
-            f'<Document href="{doc["url"]}"/>\n{doc["content"]}\n</Document>'
-            for doc in search_docs
+            f'<Document href="{doc.get("url", "")}"/>\n{doc.get("content", "")}\n</Document>'
+            for doc in docs
         ]
     )
 
@@ -104,8 +112,85 @@ def initial_context_web_search(
     search_query = gpt5_medium_reasoning\
         .with_structured_output(SearchQuery)\
             .invoke(SystemMessage(prompt))
+
+    web_search_context = tavily_search(
+        search_query.search_query,
+        max_results=10
+    )
+
+    return {
+        "initial_context": [web_search_context]
+    }
+
+def initial_context_wikipedia_search(
+    state: ResearchState
+) -> Dict:
     
+    prompt = MASTER_SYSTEM_PROMPT + f"""
+
+        Based off the following company information:
+
+        Ticker: {state.get('ticker')}
+        Company Name: {state.get('company_name')}
+        Company Sector: {state.get('company_sector')}
+
+        Build a brief query that will be used for wikipedia search.
+        The result will provide downstream agents initial context 
+        about the above company. The query should produce results 
+        that provide general information about the company itself 
+        for downstream grounding context.
+    """
+
+    search_query = gpt5_medium_reasoning\
+        .with_structured_output(SearchQuery)\
+            .invoke([SystemMessage(prompt)])
+
+    print(search_query.search_query)
+
+    search_docs = WikipediaLoader(
+        query=search_query.search_query, 
+        load_max_docs=10
+    ).load()
+
+    formatted_search_docs = "\n\n---\n\n".join(
+        [
+            f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content}\n</Document>'
+            for doc in search_docs
+        ]
+    )
+
+    return {"initial_context": [formatted_search_docs]} 
+    
+def initial_context_summariser(
+    state: ResearchState
+) -> Dict:
+    """
+    """
+
+def create_and_compile_graph():
+
+    graph = StateGraph()
+    graph.add_node("initial_context_web_search", initial_context_web_search)
+    graph.add_node("initial_context_wikipedia_search", initial_context_wikipedia_search)
+    graph.add_node("initial_context_summariser", initial_context_summariser)
+
+    graph.add_edge(START, "initial_context_web_search")
+    graph.add_edge(START, "initial_context_wikipedia_search")
+
+    graph.add_edge("initial_context_web_search", "initial_context_summariser")
+    graph.add_edge("initial_context_wikipedia_search", "initial_context_summariser")
+
+    return graph.compile()
+
 if __name__ == '__main__':
-    search_result = tavily_search("Verastar company")
+
+    test = initial_context_wikipedia_search(
+        {
+            "ticker": "AAPL",
+            "company_name": "Apple",
+            "company_sector": "Technology"
+        }
+    )
+
     with open('test_search_result.txt', 'wb') as f:
-        f.write(search_result.encode('utf-8'))
+        f.write(test['initial_context'][0].encode('utf-8'))
