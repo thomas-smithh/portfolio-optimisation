@@ -323,7 +323,7 @@ def agent(
     if state.get('rolling_message_summary'):
         prompt = prompt + "\n\nPrior Message Summary:\n\n" + state.get('rolling_message_summary')
 
-    agent_result = gpt5_medium_reasoning\
+    agent_result = gpt5_high_reasoning\
         .bind_tools([tavily_search_tool])\
             .invoke(
                 [
