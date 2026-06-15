@@ -1,1 +1,17 @@
+# Secrets / credentials
 **/api_keys.py
+api_keys.json
+*.key
+.env
+
+# Large data directories
+Data_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
