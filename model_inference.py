@@ -18,11 +18,17 @@ def build_predictions_and_metrics(
     fold_label: str | int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     model.fit(X_train_fold, y_train_fold)
-    y_pred_fold = model.predict(X_test_fold)
+    y_pred_fold_log = model.predict(X_test_fold)
+
+    # The model is trained on log returns; convert both predictions and targets
+    # back to simple % price change so every surfaced value (and all downstream
+    # metrics / stock selection) is directly comparable to raw returns.
+    y_pred_fold = np.expm1(y_pred_fold_log)
+    y_true_fold = np.expm1(y_test_fold.values)
 
     predictions_fold = pd.DataFrame(
         {
-            "y_true": y_test_fold.values,
+            "y_true": y_true_fold,
             "y_pred": y_pred_fold,
         },
         index=X_test_fold.index,
@@ -36,10 +42,10 @@ def build_predictions_and_metrics(
                 lambda x: x.quantile(marketcap_quantile)
             )
 
-    rmse = float(np.sqrt(mean_squared_error(y_test_fold, y_pred_fold)))
+    rmse = float(np.sqrt(mean_squared_error(y_true_fold, y_pred_fold)))
     mape = float(
         np.mean(
-            np.abs((y_test_fold - y_pred_fold) / np.clip(np.abs(y_test_fold), 1e-8, None))
+            np.abs((y_true_fold - y_pred_fold) / np.clip(np.abs(y_true_fold), 1e-8, None))
         ) * 100
     )
     metrics_fold = pd.DataFrame(
@@ -48,9 +54,9 @@ def build_predictions_and_metrics(
             "value": [
                 int(len(X_train_fold)),
                 int(len(X_test_fold)),
-                float(mean_absolute_error(y_test_fold, y_pred_fold)),
+                float(mean_absolute_error(y_true_fold, y_pred_fold)),
                 rmse,
-                float(r2_score(y_test_fold, y_pred_fold)),
+                float(r2_score(y_true_fold, y_pred_fold)),
                 mape,
             ],
         }
@@ -247,7 +253,10 @@ def fit_and_predict(
     model = XGBRegressor(**xgboost_args)
     model.fit(X_train, y_train)
     market_cap_quantile = X_inference.groupby('calendardate').marketcap.quantile(marketcap_quantile).reset_index()
-    inference_predictions = pd.DataFrame(model.predict(X_inference), columns=['y_pred'], index=X_inference.index).reset_index()\
+    # Model predicts log returns; convert back to simple % price change so the
+    # output `y_pred` is comparable to realized returns.
+    y_pred_log = model.predict(X_inference)
+    inference_predictions = pd.DataFrame(np.expm1(y_pred_log), columns=['y_pred'], index=X_inference.index).reset_index()\
         .merge(X_inference.reset_index()[['ticker', 'calendardate', 'close', 'close_max', 'marketcap']])
     inference_predictions = inference_predictions.merge(market_cap_quantile.rename(columns={"marketcap":'marketcap_quantile'}))
     return inference_predictions

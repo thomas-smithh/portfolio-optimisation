@@ -35,6 +35,28 @@ set_config(transform_output = "pandas")
 
 DATA_FOLDER = "Data_01_04_2026"
 
+def _downcast_floats(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Downcast all float64 columns to float32 in place to roughly halve memory.
+
+    This is loss-free for modelling purposes: XGBoost internally casts its
+    inputs to float32 when building the DMatrix, so the model sees identical
+    values either way. Non-float columns (ticker, datetimes, ints) are left
+    untouched.
+
+    Args:
+        df: DataFrame to downcast.
+
+    Returns:
+        The same DataFrame with float64 columns converted to float32.
+    """
+    float_cols = df.select_dtypes(include=['float64']).columns
+    if len(float_cols):
+        df[float_cols] = df[float_cols].astype('float32')
+    return df
+
 def check_quarterly_stock(
     data: pd.DataFrame
 ) -> bool:
@@ -244,7 +266,7 @@ def get_stock_technicals(
         standard deviations.
     """
 
-    stock_technicals = pd.read_parquet(f'{DATA_FOLDER}\\SHARADAR_SEP.parquet')
+    stock_technicals = pd.read_parquet(f'{DATA_FOLDER}/SHARADAR_SEP.parquet')
     stock_technicals = stock_technicals[stock_technicals.ticker.isin(stock_fundamentals.ticker)]
     stock_technicals.drop(
         [
@@ -257,10 +279,13 @@ def get_stock_technicals(
     )
     stock_technicals.date = pd.to_datetime(stock_technicals.date)
     stock_technicals = stock_technicals.sort_values(['ticker', 'date'])
-    technical_indicators = Parallel(n_jobs=4)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), 24))
+    technical_indicators = Parallel(n_jobs=8)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), 24))
     technical_indicators = pd.concat(technical_indicators)
     technical_indicators.rename(columns={'date': 'calendardate'}, inplace=True)
     technical_indicators = technical_indicators.reset_index(drop=True)
+    # Downcast the base technical frame to float32 up front so every chunk and
+    # expanding aggregate below is half the size (the main OOM driver).
+    technical_indicators = _downcast_floats(technical_indicators)
     del stock_technicals
     gc.collect()
 
@@ -274,6 +299,11 @@ def get_stock_technicals(
     for i, chunk_tickers in enumerate(ticker_chunks):
         print(f"       Aggregating chunk {i + 1}/{n_chunks} ({len(chunk_tickers)} tickers)...")
         chunk = technical_indicators[technical_indicators['ticker'].isin(chunk_tickers)].copy()
+        # Sort by [ticker, calendardate] so the expanding() outputs (which are
+        # returned in group-sorted order) line up with the chunk['ticker']
+        # reassignment below. Without this the *_mean/_median/_std columns can
+        # be silently misaligned across tickers.
+        chunk = chunk.sort_values(['ticker', 'calendardate'])
         chunk_indexed = chunk.set_index('calendardate')
         grouped = chunk_indexed.groupby('ticker', as_index=False)
 
@@ -442,6 +472,12 @@ def derive_target_variables(
     gc.collect()
 
     out["close_pct_change"] = out["close_end"] / out["close_start"] - 1
+    # Log-return target with a one-sided floor at -99.9% so total losses
+    # (delistings/bankruptcies, where pct_change == -1) stay finite instead of
+    # mapping to -inf. Log compresses the extreme upper tail (e.g. +20,900%)
+    # so the squared-error objective no longer chases a handful of microcap
+    # outliers. Outputs are converted back to simple % change at prediction time.
+    out["close_log_return"] = np.log1p(out["close_pct_change"].clip(lower=-0.999))
     out["horizon_days"] = (out["effective_end_date"] - out["calendardate"]).dt.days
 
     return out
@@ -584,19 +620,19 @@ def main(
 
         print(f"[8/11] {half_label} - Splitting train / inference & writing to disk...")
         Xy_train = data_chunk[data_chunk.calendardate < inference_batch_min_date]\
-            .merge(targets_chunk[['ticker', 'calendardate', 'close_pct_change']])\
+            .merge(targets_chunk[['ticker', 'calendardate', 'close_log_return']])\
             .set_index(['ticker', 'calendardate'])\
-            .dropna(subset=['close_pct_change'])\
+            .dropna(subset=['close_log_return'])\
             .drop_duplicates()
 
         Xy_inference = data_chunk[data_chunk.calendardate >= inference_batch_min_date]\
-            .merge(targets_chunk[['ticker', 'calendardate', 'close_pct_change']])\
+            .merge(targets_chunk[['ticker', 'calendardate', 'close_log_return']])\
             .set_index(['ticker', 'calendardate'])\
             .drop_duplicates()
 
-        X_train_c = Xy_train.drop('close_pct_change', axis=1)
-        y_train_c = Xy_train.close_pct_change
-        X_inf_c = Xy_inference.drop('close_pct_change', axis=1)
+        X_train_c = _downcast_floats(Xy_train.drop('close_log_return', axis=1))
+        y_train_c = Xy_train.close_log_return.astype('float32')
+        X_inf_c = _downcast_floats(Xy_inference.drop('close_log_return', axis=1))
 
         print(f"        -> X_train: {X_train_c.shape}, X_inference: {X_inf_c.shape}")
 
