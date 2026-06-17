@@ -33,6 +33,17 @@ warnings.filterwarnings('ignore')  # re-apply after imports
 np.seterr(all='ignore')  # suppress numpy RuntimeWarnings (e.g. divide-by-zero in ta lib)
 set_config(transform_output = "pandas")
 
+# Optional memory-profiling hooks. No-ops unless a MemoryMonitor is running
+# (see run_feature_derivation.py / _memlog.py), so importing is always safe.
+try:
+    from _memlog import set_phase as _mem_phase, note as _mem_note
+except Exception:  # pragma: no cover - profiler is optional
+    def _mem_phase(name):
+        pass
+
+    def _mem_note(msg):
+        pass
+
 DATA_FOLDER = "Data_01_04_2026"
 
 def _downcast_floats(
@@ -90,12 +101,75 @@ def get_technical_indicators(
     """
     
     try:
-        return data.groupby('ticker').apply(lambda x: add_all_ta_features(x, open="open", high="high", low="low", close="close", volume="volume", fillna=True))
+        result = data.groupby('ticker').apply(lambda x: add_all_ta_features(x, open="open", high="high", low="low", close="close", volume="volume", fillna=True))
+        # Downcast to float32 immediately so the parallel workers return (and
+        # pickle back to the parent) half-size frames.
+        return _downcast_floats(result)
     except:
         return None
 
+def _carry_forward_quarterly_grid(
+    df: pd.DataFrame,
+    value_cols: list,
+    max_carry_forward_quarters: int,
+) -> pd.DataFrame:
+    """
+    Reindex each ticker onto an unbroken quarter-end grid and forward-fill its
+    fundamentals, capping how many quarters a value may be carried.
+
+    Filing cadence is irregular (late filings, more than one filing landing in a
+    single calendar quarter, slower annual 10-Ks), which otherwise leaves holes
+    that make tickers drop out of and re-enter the dataset quarter-on-quarter.
+    Each ticker's grid spans from its first quarter to
+    ``max_carry_forward_quarters`` quarters beyond its last quarter, and the
+    forward fill uses the same cap, so a value is never carried more than that
+    many quarters past the filing that produced it.  Holes longer than the cap
+    stay NaN and are dropped by the caller's market-cap filter.  The fill only
+    propagates past -> future, so it introduces no look-ahead.
+
+    Args:
+        df: Fundamentals keyed by ``ticker`` and a quarter-end ``calendardate``.
+        value_cols: Columns to carry forward.
+        max_carry_forward_quarters: Maximum quarters to carry a value forward.
+
+    Returns:
+        The reindexed, forward-filled fundamentals on a continuous grid.
+    """
+    n = int(max_carry_forward_quarters)
+    df = df.sort_values(['ticker', 'calendardate'])
+    spans = df.groupby('ticker')['calendardate'].agg(['min', 'max']).reset_index()
+
+    # Don't fabricate quarters beyond the dataset's latest quarter: trailing
+    # carry-forward is bounded by the global max so we never emit future rows
+    # (a delisted ticker still gets its full historical trailing fill).
+    global_max_p = pd.Timestamp(df['calendardate'].max()).to_period('Q')
+
+    tickers_out = []
+    dates_out = []
+    for ticker, lo, hi in spans.itertuples(index=False):
+        end_p = min(pd.Timestamp(hi).to_period('Q') + n, global_max_p)
+        qs = pd.period_range(
+            pd.Timestamp(lo).to_period('Q'),
+            end_p,
+            freq='Q',
+        ).to_timestamp(how='end').normalize()
+        tickers_out.append(np.repeat(ticker, len(qs)))
+        dates_out.append(qs.values)
+
+    full_idx = pd.DataFrame({
+        'ticker': np.concatenate(tickers_out),
+        'calendardate': np.concatenate(dates_out),
+    })
+    full_idx['ticker'] = full_idx['ticker'].astype(df['ticker'].dtype)
+    full_idx['calendardate'] = full_idx['calendardate'].astype('datetime64[ns]')
+
+    merged = full_idx.merge(df, on=['ticker', 'calendardate'], how='left')
+    merged[value_cols] = merged.groupby('ticker', sort=False)[value_cols].ffill(limit=n)
+    return merged
+
 def get_stock_fundamentals(
-    market_cap_lower_limit: float = 0.25
+    market_cap_lower_limit: float = 0.25,
+    max_carry_forward_quarters: int = 4,
 ) -> pd.DataFrame:
     """
     Load and preprocess quarterly stock fundamentals.
@@ -103,10 +177,13 @@ def get_stock_fundamentals(
     Args:
         market_cap_lower_limit: Quantile threshold used to filter out stocks
             below the minimum market capitalization for each calendar date.
+        max_carry_forward_quarters: Maximum number of quarters a ticker's
+            last-known fundamentals are carried forward onto a continuous
+            quarterly grid, giving consistent quarter-on-quarter membership.
 
     Returns:
-        A fundamentals DataFrame filtered to quarterly filings, forward-filled
-        within ticker, shifted to quarter-end availability, and restricted to
+        A fundamentals DataFrame filtered to quarterly filings, reindexed onto a
+        continuous quarterly grid with capped carry-forward, and restricted to
         stocks above the date-specific market cap threshold.
     """
     stock_fundamentals = pd.read_parquet(f'{DATA_FOLDER}/SHARADAR_SF1.parquet')
@@ -123,13 +200,13 @@ def get_stock_fundamentals(
     )
 
     stock_fundamentals = stock_fundamentals.loc[stock_fundamentals.groupby(['ticker', 'datekey_q']).datekey.idxmax()]
-    stock_fundamentals['time_since_reported'] = (
-        stock_fundamentals['datekey_q'] - stock_fundamentals['datekey']
-    ).dt.days
     stock_fundamentals['time_since_reporting_period'] = (
         stock_fundamentals['datekey'] - stock_fundamentals['fiscalperiod']
     ).dt.days
-    stock_fundamentals = stock_fundamentals.drop(['calendardate', 'datekey'], axis=1)
+    # Drop the original report-period calendardate; the filing-quarter
+    # (datekey_q) becomes the canonical quarter. Keep `datekey` for now so
+    # staleness can be recomputed after the carry-forward reindex below.
+    stock_fundamentals = stock_fundamentals.drop(['calendardate'], axis=1)
     stock_fundamentals = stock_fundamentals.rename(columns={'datekey_q': 'calendardate'})
     stock_fundamentals = stock_fundamentals.sort_values(["ticker", "calendardate"]).reset_index(drop=True)
     cols_to_fill = [c for c in stock_fundamentals.columns if c != "ticker"]
@@ -137,9 +214,26 @@ def get_stock_fundamentals(
         stock_fundamentals.groupby("ticker")[cols_to_fill].ffill()
     )
     stock_fundamentals = stock_fundamentals[~stock_fundamentals.isna().all(axis=1)]
+
+    # Reindex each ticker onto a continuous quarterly grid and carry its
+    # last-known fundamentals forward (capped) so membership is consistent
+    # quarter-on-quarter instead of dropping out and re-entering when filings
+    # arrive irregularly.
+    value_cols = [c for c in stock_fundamentals.columns if c not in ('ticker', 'calendardate')]
+    stock_fundamentals = _carry_forward_quarterly_grid(
+        stock_fundamentals, value_cols, max_carry_forward_quarters
+    )
+
+    # Recompute staleness against the (possibly carried-forward) calendar quarter
+    # so filled quarters correctly reflect ageing fundamentals.
+    stock_fundamentals['time_since_reported'] = (
+        stock_fundamentals['calendardate'] - stock_fundamentals['datekey']
+    ).dt.days
+
     stock_fundamentals = stock_fundamentals[stock_fundamentals.marketcap.notna() & stock_fundamentals.ticker.notna()]
     stock_fundamentals = stock_fundamentals.drop(
         [
+            'datekey',
             'lastupdated', 
             'reportperiod', 
             'dimension',
@@ -251,21 +345,36 @@ def derive_fundamental_momentum(
     return result
 
 def get_stock_technicals(
-    stock_fundamentals: pd.DataFrame
-) -> pd.DataFrame():
+    stock_fundamentals: pd.DataFrame,
+    tmp_dir: str,
+    half_idx: int = 0,
+    n_chunks: int = 16,
+) -> list:
     """
-    Load price history and derive ticker-level technical features.
+    Load price history, derive ticker-level technical features, and stream the
+    result to disk one ticker-chunk at a time.
+
+    Rather than returning a single ~50 GB daily frame (561 columns over ~22M
+    rows per half) and holding every chunk in a list before concatenating
+    (which doubles peak memory to ~100 GB and OOM-kills the process), each
+    ticker chunk's full feature set is written to its own parquet file and
+    freed immediately.  This bounds peak memory to a single chunk and lets the
+    caller merge each chunk from disk lazily.
 
     Args:
         stock_fundamentals: Fundamentals data used to limit the technical
             dataset to the relevant ticker universe.
+        tmp_dir: Directory to stream per-chunk parquet files into.
+        half_idx: Index of the ticker half being processed (used in filenames).
+        n_chunks: Number of ticker chunks to split the aggregation into. More
+            chunks => lower peak memory per chunk.
 
     Returns:
-        A DataFrame of raw technical indicators plus expanding aggregate
-        statistics such as cumulative maxima, minima, means, medians, and
-        standard deviations.
+        A list of parquet file paths, one per ticker chunk, each containing the
+        raw technical indicators plus expanding aggregate statistics.
     """
 
+    _mem_phase(f"tech_load_h{half_idx}")
     stock_technicals = pd.read_parquet(f'{DATA_FOLDER}/SHARADAR_SEP.parquet')
     stock_technicals = stock_technicals[stock_technicals.ticker.isin(stock_fundamentals.ticker)]
     stock_technicals.drop(
@@ -279,6 +388,8 @@ def get_stock_technicals(
     )
     stock_technicals.date = pd.to_datetime(stock_technicals.date)
     stock_technicals = stock_technicals.sort_values(['ticker', 'date'])
+
+    _mem_phase(f"tech_ta_h{half_idx}")
     technical_indicators = Parallel(n_jobs=8)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), 24))
     technical_indicators = pd.concat(technical_indicators)
     technical_indicators.rename(columns={'date': 'calendardate'}, inplace=True)
@@ -289,15 +400,17 @@ def get_stock_technicals(
     del stock_technicals
     gc.collect()
 
-    # Process expanding aggregations in ticker chunks to avoid OOM.
-    # Only one chunk's aggregations live in memory at a time.
+    # Process expanding aggregations in ticker chunks, streaming each chunk's
+    # result straight to disk so only one chunk lives in memory at a time.
     unique_tickers = technical_indicators['ticker'].unique()
-    n_chunks = 8
     ticker_chunks = np.array_split(unique_tickers, n_chunks)
-    agg_results = []
+    chunk_paths = []
 
     for i, chunk_tickers in enumerate(ticker_chunks):
+        if len(chunk_tickers) == 0:
+            continue
         print(f"       Aggregating chunk {i + 1}/{n_chunks} ({len(chunk_tickers)} tickers)...")
+        _mem_phase(f"tech_agg_h{half_idx}_c{i + 1}")
         chunk = technical_indicators[technical_indicators['ticker'].isin(chunk_tickers)].copy()
         # Sort by [ticker, calendardate] so the expanding() outputs (which are
         # returned in group-sorted order) line up with the chunk['ticker']
@@ -335,16 +448,19 @@ def get_stock_technicals(
         agg5 = agg5.set_index(['ticker', 'calendardate'])
 
         chunk_full = pd.concat([chunk, agg1, agg2, agg3, agg4, agg5], axis=1).reset_index()
-        agg_results.append(chunk_full)
+        chunk_full = _downcast_floats(chunk_full)
+
+        path = f"{tmp_dir}/_tech_h{half_idx}_c{i}.parquet"
+        chunk_full.to_parquet(path, index=False)
+        chunk_paths.append(path)
 
         del chunk, chunk_indexed, grouped, agg1, agg2, agg3, agg4, agg5, chunk_full
         gc.collect()
 
-    technical_indicators = pd.concat(agg_results, ignore_index=True)
-    del agg_results
+    del technical_indicators
     gc.collect()
 
-    return technical_indicators
+    return chunk_paths
 
 def get_sector_fundamentals(
     ticker_data: pd.DataFrame,
@@ -520,13 +636,16 @@ def main(
 
     # ── Phase 1: Load fundamentals & sector data (shared across chunks) ──
     print("[1/11] Loading ticker data...")
+    _mem_phase("load_tickers")
     ticker_data = pd.read_parquet(f'{DATA_FOLDER}/SHARADAR_TICKERS.parquet')
 
     print("[2/11] Building stock fundamentals...")
+    _mem_phase("stock_fundamentals")
     stock_fundamentals = get_stock_fundamentals(min_market_cap)
     print(f"        -> {stock_fundamentals.shape[0]:,} rows, {stock_fundamentals.shape[1]} cols")
 
     print("[3/11] Building sector fundamentals...")
+    _mem_phase("sector_fundamentals")
     sector_fundamentals = get_sector_fundamentals(
         ticker_data=ticker_data,
         stock_fundamentals=stock_fundamentals
@@ -536,6 +655,7 @@ def main(
     gc.collect()
 
     print("[4/11] Deriving fundamental momentum features...")
+    _mem_phase("fundamental_momentum")
     stock_fundamentals = derive_fundamental_momentum(stock_fundamentals)
     print(f"        -> {stock_fundamentals.shape[0]:,} rows, {stock_fundamentals.shape[1]} cols")
 
@@ -560,25 +680,26 @@ def main(
         fund_chunk = stock_fundamentals[stock_fundamentals['ticker'].isin(half_tickers)].copy()
 
         print(f"[5/11] {half_label} - Building stock technicals...")
-        tech_chunk = get_stock_technicals(fund_chunk)
-        print(f"        -> {tech_chunk.shape[0]:,} rows, {tech_chunk.shape[1]} cols")
-
-        tech_chunk["calendardate"] = pd.to_datetime(tech_chunk["calendardate"]).astype("datetime64[ns]")
-        tech_chunk = tech_chunk.dropna(subset=["calendardate", "ticker"])
-        tech_chunk = tech_chunk.sort_values(["calendardate", "ticker"]).reset_index(drop=True)
-
-        fund_chunk = fund_chunk[fund_chunk.ticker.isin(tech_chunk.ticker)]
+        tech_paths = get_stock_technicals(
+            fund_chunk, tmp_dir=tmp_dir, half_idx=half_idx, n_chunks=16
+        )
+        print(f"        -> {len(tech_paths)} technical chunk files streamed to disk")
 
         print(f"[6/11] {half_label} - Merging fundamentals, technicals & sector data...")
+        _mem_phase(f"merge_h{half_idx}")
         merged = []
-        merge_chunks = np.array_split(fund_chunk.ticker.unique(), 12)
-        for tickers in tqdm(merge_chunks, desc=f"  {half_label} merge"):
-            left = fund_chunk[fund_chunk.ticker.isin(tickers)].sort_values(["calendardate", "ticker"])
-            right = tech_chunk[tech_chunk.ticker.isin(tickers)]\
-                .assign(_technical_match_flag=1)\
-                .sort_values(["calendardate", "ticker"])
+        for tpath in tqdm(tech_paths, desc=f"  {half_label} merge"):
+            right = pd.read_parquet(tpath)
+            right["calendardate"] = pd.to_datetime(right["calendardate"]).astype("datetime64[ns]")
+            right = right.dropna(subset=["calendardate", "ticker"])
+            chunk_tickers = right["ticker"].unique()
+
+            left = fund_chunk[fund_chunk.ticker.isin(chunk_tickers)].sort_values(["calendardate", "ticker"])
+            right = right.assign(_technical_match_flag=1).sort_values(["calendardate", "ticker"])
 
             if left.empty or right.empty:
+                del left, right
+                gc.collect()
                 continue
 
             temp = pd.merge_asof(
@@ -588,6 +709,8 @@ def main(
             )
             temp = temp[temp["_technical_match_flag"].notna()].drop(columns="_technical_match_flag")
             if temp.empty:
+                del left, right, temp
+                gc.collect()
                 continue
 
             temp = pd.merge_asof(
@@ -600,7 +723,14 @@ def main(
             del left, right, temp
             gc.collect()
 
-        del fund_chunk, tech_chunk
+        # Technical chunk files have served their purpose; reclaim the disk.
+        for tpath in tech_paths:
+            try:
+                os.remove(tpath)
+            except OSError:
+                pass
+
+        del fund_chunk
         gc.collect()
 
         if not merged:
@@ -616,9 +746,11 @@ def main(
         data_chunk = data_chunk.set_index(['ticker', 'calendardate']).reset_index()
 
         print(f"[7/11] {half_label} - Deriving target variables...")
+        _mem_phase(f"targets_h{half_idx}")
         targets_chunk = derive_target_variables(data_chunk[["ticker", "calendardate"]])
 
         print(f"[8/11] {half_label} - Splitting train / inference & writing to disk...")
+        _mem_phase(f"split_write_h{half_idx}")
         Xy_train = data_chunk[data_chunk.calendardate < inference_batch_min_date]\
             .merge(targets_chunk[['ticker', 'calendardate', 'close_log_return']])\
             .set_index(['ticker', 'calendardate'])\
@@ -650,6 +782,7 @@ def main(
     # ── Phase 3: Consolidate both halves ──
     print(f"\n{'='*60}")
     print("[9/11] Consolidating halves from disk...")
+    _mem_phase("consolidate")
     X_train = pd.concat([
         pd.read_parquet(f'{tmp_dir}/X_train_{i}.parquet') for i in range(2)
     ])

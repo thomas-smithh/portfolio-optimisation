@@ -7,6 +7,9 @@ api_keys.json
 # Large data directories
 Data_*/
 
+# Memory-profiling logs
+_mem_log/
+
 # Python
 __pycache__/
 *.py[cod]
