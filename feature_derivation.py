@@ -410,7 +410,16 @@ def get_stock_technicals(
     stock_technicals = stock_technicals.sort_values(['ticker', 'date'])
 
     _mem_phase(f"tech_ta_h{half_idx}")
-    technical_indicators = Parallel(n_jobs=8)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), 24))
+    # add_all_ta_features is inherently per-series (rolling windows can't cross
+    # ticker boundaries), so each ticker is one call regardless of how we group;
+    # the only speed lever is parallelism. Use more workers on this CPU-bound
+    # phase and split into finer batches than workers so a batch full of long
+    # histories can't stall a whole wave (better load balancing). Each in-flight
+    # worker only holds one batch (~1/n_ta_batches of a half), so the extra
+    # concurrency adds little peak memory on top of the accumulated result list.
+    n_ta_workers = 16
+    n_ta_batches = 48
+    technical_indicators = Parallel(n_jobs=n_ta_workers)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), n_ta_batches))
     # Drop any wholly-failed batches (None) explicitly rather than relying on
     # pd.concat silently skipping them, and surface how many tickers were lost.
     technical_indicators = [t for t in technical_indicators if t is not None]
@@ -708,7 +717,7 @@ def main(
 
         print(f"[5/11] {half_label} - Building stock technicals...")
         tech_paths = get_stock_technicals(
-            fund_chunk, tmp_dir=tmp_dir, half_idx=half_idx, n_chunks=16
+            fund_chunk, tmp_dir=tmp_dir, half_idx=half_idx, n_chunks=4
         )
         print(f"        -> {len(tech_paths)} technical chunk files streamed to disk")
 
