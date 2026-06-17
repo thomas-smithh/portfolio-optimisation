@@ -91,22 +91,42 @@ def get_technical_indicators(
     """
     Generate technical analysis indicators from price action data.
 
+    Each ticker is processed independently so that a failure on one ticker
+    (e.g. ``add_all_ta_features`` raising on a pathological price series) only
+    drops that single ticker rather than discarding the entire parallel batch.
+    The previous implementation wrapped a whole-batch ``groupby.apply`` in one
+    ``try/except`` returning ``None``; because ``pd.concat`` silently skips
+    ``None``, a single bad ticker silently removed every ticker that shared its
+    batch — losing ~36% of the universe.
+
     Args:
         data: Price history containing `ticker`, OHLC, and `volume` columns.
 
     Returns:
-        A DataFrame with technical indicators for each ticker when feature
-        generation succeeds. Returns None if the underlying TA calculation
-        fails.
+        A DataFrame with technical indicators for every ticker whose TA
+        calculation succeeds. Returns None only if no ticker in the batch
+        could be processed.
     """
-    
-    try:
-        result = data.groupby('ticker').apply(lambda x: add_all_ta_features(x, open="open", high="high", low="low", close="close", volume="volume", fillna=True))
-        # Downcast to float32 immediately so the parallel workers return (and
-        # pickle back to the parent) half-size frames.
-        return _downcast_floats(result)
-    except:
+
+    frames = []
+    for _, group in data.groupby('ticker', sort=False):
+        try:
+            frames.append(
+                add_all_ta_features(
+                    group, open="open", high="high", low="low",
+                    close="close", volume="volume", fillna=True,
+                )
+            )
+        except Exception:
+            # Skip only this ticker; keep the rest of the batch.
+            continue
+
+    if not frames:
         return None
+
+    # Downcast to float32 immediately so the parallel workers return (and
+    # pickle back to the parent) half-size frames.
+    return _downcast_floats(pd.concat(frames, ignore_index=True))
 
 def _carry_forward_quarterly_grid(
     df: pd.DataFrame,
@@ -391,7 +411,14 @@ def get_stock_technicals(
 
     _mem_phase(f"tech_ta_h{half_idx}")
     technical_indicators = Parallel(n_jobs=8)(delayed(get_technical_indicators)(stock_technicals[stock_technicals.ticker.isin(x)]) for x in np.array_split(stock_technicals.ticker.unique(), 24))
-    technical_indicators = pd.concat(technical_indicators)
+    # Drop any wholly-failed batches (None) explicitly rather than relying on
+    # pd.concat silently skipping them, and surface how many tickers were lost.
+    technical_indicators = [t for t in technical_indicators if t is not None]
+    technical_indicators = pd.concat(technical_indicators, ignore_index=True)
+    n_in = stock_technicals.ticker.nunique()
+    n_out = technical_indicators.ticker.nunique()
+    if n_out < n_in:
+        print(f"        ! technicals: {n_in - n_out} of {n_in} tickers dropped during TA computation")
     technical_indicators.rename(columns={'date': 'calendardate'}, inplace=True)
     technical_indicators = technical_indicators.reset_index(drop=True)
     # Downcast the base technical frame to float32 up front so every chunk and
