@@ -85,7 +85,7 @@ def compute_distribution_metric(
 # Optuna objective
 # ---------------------------------------------------------------------------
 
-def _make_objective(X_train, y_train, top_n, weights, trial_log_path, predictions_dir):
+def _make_objective(X_train, y_train, top_n, weights, trial_log_path, predictions_dir, max_gpu_workers):
     """Return an Optuna objective closure over the training data."""
 
     fieldnames = [
@@ -115,7 +115,7 @@ def _make_objective(X_train, y_train, top_n, weights, trial_log_path, prediction
             "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
             "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-            "num_parallel_tree": trial.suggest_int("num_parallel_tree", 1, 8),
+            "num_parallel_tree": trial.suggest_int("num_parallel_tree", 1, 20),
         }
 
         logger = logging.getLogger("hptuning")
@@ -130,6 +130,7 @@ def _make_objective(X_train, y_train, top_n, weights, trial_log_path, prediction
             X_train, y_train,
             whole_back_test=True,
             marketcap_quantile=0.25,
+            max_gpu_workers=max_gpu_workers,
             **params,
         )
 
@@ -219,6 +220,8 @@ def run_hyperparameter_tuning(
     study_name: str = "xgb_portfolio_opt",
     log_dir: str | None = None,
     data_folder: str | None = None,
+    n_startup_trials: int = 10,
+    max_gpu_workers: int = 1,
 ) -> optuna.study.Study:
     """
     Run Bayesian hyperparameter optimisation for the XGBoost portfolio model.
@@ -245,6 +248,18 @@ def run_hyperparameter_tuning(
         Directory for log files; defaults to ``<DATA_FOLDER>/results``.
     data_folder : str, optional
         Data folder override.
+    n_startup_trials : int
+        Number of initial random-exploration trials before TPE takes over.
+        ``TPESampler`` samples these uniformly at random to seed the search
+        space, then switches to model-guided sampling for the remaining
+        ``n_trials - n_startup_trials`` trials (the standard random-then-TPE
+        pattern).
+    max_gpu_workers : int
+        Number of backtest folds trained concurrently inside each trial's
+        ``back_test`` call.  Each fold materialises its own full copy of the
+        training/test data, so higher values multiply peak RAM (and share the
+        GPU).  Defaults to 1 (sequential folds) to keep memory bounded; raise
+        only if you have headroom.
 
     Returns
     -------
@@ -288,7 +303,7 @@ def run_hyperparameter_tuning(
     if X_train is None or y_train is None:
         logger.info("Loading data from %s/preprocessed_data …", data_folder)
         X_train = pd.read_parquet(f"{data_folder}/preprocessed_data/X_train.parquet")
-        y_train = pd.read_parquet(f"{data_folder}/preprocessed_data/y_train.parquet")["pct_change"]
+        y_train = pd.read_parquet(f"{data_folder}/preprocessed_data/y_train.parquet")["close_log_return"]
 
     logger.info("X_train shape: %s | y_train length: %d", X_train.shape, len(y_train))
     logger.info("top_n=%d | weights=%s", top_n, weights or {"25%": 0.35, "50%": 0.40, "75%": 0.25})
@@ -297,9 +312,12 @@ def run_hyperparameter_tuning(
     logger.info("Full log      → %s", log_file)
 
     # ---- optuna study -----------------------------------------------------
+    # Standard random-then-TPE search: the first ``n_startup_trials`` trials are
+    # sampled uniformly at random to explore the space, after which TPE switches
+    # to model-guided sampling using those observations.
     sampler = optuna.samplers.TPESampler(
         seed=42,
-        n_startup_trials=6,   # matches number of seed trials; TPE starts right after
+        n_startup_trials=n_startup_trials,
         multivariate=True,     # model parameter correlations jointly
         constant_liar=True,    # avoid clustering while trials are in-flight
     )
@@ -309,45 +327,14 @@ def run_hyperparameter_tuning(
         sampler=sampler,
     )
 
-    # ---- seed the study with the known-good config + perturbations --------
-    # Exact config that performed well in notebook backtesting
-    base_params = {
-        "n_estimators": 600,
-        "learning_rate": 0.015,
-        "max_depth": 6,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "colsample_bynode": 0.8,
-        "min_child_weight": 1,
-        "gamma": 0.0,
-        "reg_alpha": 1e-8,
-        "reg_lambda": 1e-8,
-        "num_parallel_tree": 10,
-    }
-    study.enqueue_trial(base_params)
+    logger.info(
+        "TPE search: %d random exploration trials first, then TPE for the "
+        "remaining %d trials.",
+        min(n_startup_trials, n_trials),
+        max(0, n_trials - n_startup_trials),
+    )
 
-    # Perturbations around the known-good config to explore nearby space
-    perturbations = [
-        # More trees per round
-        {**base_params, "num_parallel_tree": 18},
-        # Slightly higher learning rate with fewer estimators
-        {**base_params, "learning_rate": 0.03, "n_estimators": 400},
-        # Deeper trees
-        {**base_params, "max_depth": 8, "learning_rate": 0.01},
-        # Lower colsample to add regularisation
-        {**base_params, "colsample_bytree": 0.6, "colsample_bynode": 0.6},
-        # More estimators
-        {**base_params, "n_estimators": 1000},
-    ]
-    for p in perturbations:
-        study.enqueue_trial(p)
-
-    logger.info("Enqueued %d seed trials (1 base + %d perturbations), "
-                "remaining %d trials will be sampled by TPE.",
-                1 + len(perturbations), len(perturbations),
-                max(0, n_trials - 1 - len(perturbations)))
-
-    objective = _make_objective(X_train, y_train, top_n, weights, trial_csv, predictions_dir)
+    objective = _make_objective(X_train, y_train, top_n, weights, trial_csv, predictions_dir, max_gpu_workers)
 
     try:
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)

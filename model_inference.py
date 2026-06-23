@@ -1,10 +1,14 @@
 import numpy as np
 import pandas as pd
+import os
+import warnings
 from xgboost import XGBRegressor
 from typing import Tuple
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from data_extraction import reconcile_trading212_to_sharadar
 
 DATA_FOLDER = "Data_01_04_2026"
 
@@ -214,6 +218,8 @@ def fit_and_predict(
     y_train: pd.DataFrame,
     X_inference: pd.DataFrame,
     marketcap_quantile: float = 0.25,
+    data_folder: str = None,
+    filter_to_trading212: bool = True,
     **kwargs
 ) -> pd.DataFrame:
     """
@@ -225,12 +231,25 @@ def fit_and_predict(
         X_inference: Feature matrix to score after training.
         marketcap_quantile: Quantile used to compute the per-date market cap
             threshold for the inference output.
+        data_folder: Optional override for the data directory containing the
+            Trading 212 instruments / Sharadar tickers used by the tradability
+            filter.
+        filter_to_trading212: When True, restrict the predictions to stocks that
+            were tradable on Trading 212 at the time of inference. Filtering is
+            applied only after prediction, so the model still scores the full
+            inference set and only the returned rows are limited to tradable
+            stocks. Requires `trading212_instruments.csv` and
+            `SHARADAR_TICKERS.parquet` in `data_folder`; if the instruments file
+            is absent, filtering is skipped with a warning.
         **kwargs: Additional keyword arguments forwarded to `XGBRegressor`.
 
     Returns:
         A DataFrame with predicted returns, identifiers, selected market data
         columns, and the per-date market cap quantile.
     """
+
+    if data_folder is None:
+        data_folder = DATA_FOLDER
 
     xgboost_args = {
         "n_estimators": 1000,
@@ -259,12 +278,19 @@ def fit_and_predict(
     inference_predictions = pd.DataFrame(np.expm1(y_pred_log), columns=['y_pred'], index=X_inference.index).reset_index()\
         .merge(X_inference.reset_index()[['ticker', 'calendardate', 'close', 'close_max', 'marketcap']])
     inference_predictions = inference_predictions.merge(market_cap_quantile.rename(columns={"marketcap":'marketcap_quantile'}))
+
+    if filter_to_trading212:
+        inference_predictions = _filter_to_trading212_tradable(
+            inference_predictions, data_folder
+        )
+
     return inference_predictions
 
 def obtain_inference_performance_to_date(
     inference_predictions: pd.DataFrame,
     marketcap_quantile: float = 0.25,
-    data_folder: str = None
+    data_folder: str = None,
+    filter_to_trading212: bool = True,
 ) -> pd.DataFrame:
     """
     Evaluate inference predictions against the latest available adjusted close.
@@ -281,6 +307,14 @@ def obtain_inference_performance_to_date(
             threshold in the evaluation output.
         data_folder: Optional override for the data directory containing the
             SEP price parquet file.
+        filter_to_trading212: When True, restrict the output to stocks that were
+            tradable on Trading 212 at the time of inference. Each prediction is
+            mapped to a Trading 212 instrument via
+            `reconcile_trading212_to_sharadar`, and rows are dropped unless the
+            matched instrument's `addedOn` date is on or before `calendardate`.
+            Requires `trading212_instruments.csv` and `SHARADAR_TICKERS.parquet`
+            in `data_folder`; if the instruments file is absent, filtering is
+            skipped with a warning.
 
     Returns:
         A DataFrame with predicted return, realized return to the latest price
@@ -338,6 +372,10 @@ def obtain_inference_performance_to_date(
     test_eval['marketcap_quantile'] = test_eval.groupby('calendardate').marketcap.transform(
         lambda x: x.quantile(marketcap_quantile)
     )
+
+    if filter_to_trading212:
+        test_eval = _filter_to_trading212_tradable(test_eval, data_folder)
+
     return test_eval[[
         "ticker",
         "calendardate",
@@ -348,3 +386,53 @@ def obtain_inference_performance_to_date(
         "marketcap",
         "marketcap_quantile"
     ]].sort_values("pct_change_at_max_date", ascending=False)
+
+
+def _filter_to_trading212_tradable(
+    test_eval: pd.DataFrame,
+    data_folder: str,
+) -> pd.DataFrame:
+    """Drop predictions for stocks not listed on Trading 212 at `calendardate`.
+
+    Each Sharadar `ticker` in `test_eval` is mapped to a Trading 212 instrument
+    via `reconcile_trading212_to_sharadar`, and a row is kept only if the
+    matched instrument's `addedOn` date is on or before its `calendardate`
+    (i.e. the stock was actually tradable on Trading 212 at inference time).
+    Where several Trading 212 listings map to the same Sharadar ticker, the
+    earliest `addedOn` is used.
+
+    If `trading212_instruments.csv` is missing from `data_folder`, the input is
+    returned unchanged with a warning.
+    """
+    instruments_path = f"{data_folder}/trading212_instruments.csv"
+    if not os.path.exists(instruments_path):
+        warnings.warn(
+            f"'{instruments_path}' not found; skipping Trading 212 tradability "
+            "filter.",
+            stacklevel=2,
+        )
+        return test_eval
+
+    t212 = pd.read_csv(instruments_path)
+    sharadar_tickers = pd.read_parquet(f"{data_folder}/SHARADAR_TICKERS.parquet")
+    reconciled = reconcile_trading212_to_sharadar(t212, sharadar_tickers)
+
+    # Earliest Trading 212 listing date per matched Sharadar ticker.
+    added_on = (
+        reconciled.dropna(subset=["sharadar_ticker"])
+        .assign(addedOn=lambda d: pd.to_datetime(d["addedOn"], utc=True).dt.tz_localize(None))
+        .groupby("sharadar_ticker", as_index=False)["addedOn"]
+        .min()
+        .rename(columns={"sharadar_ticker": "ticker", "addedOn": "t212_added_on"})
+    )
+    added_on["ticker"] = added_on["ticker"].astype("string")
+
+    filtered = test_eval.copy()
+    filtered["ticker"] = filtered["ticker"].astype("string")
+    filtered["calendardate"] = pd.to_datetime(filtered["calendardate"]).astype("datetime64[ns]")
+    filtered = filtered.merge(added_on, on="ticker", how="left")
+    # Keep only stocks matched to a Trading 212 listing that existed at inference.
+    keep = filtered["t212_added_on"].notna() & (
+        filtered["t212_added_on"] <= filtered["calendardate"]
+    )
+    return filtered[keep].drop(columns="t212_added_on")
