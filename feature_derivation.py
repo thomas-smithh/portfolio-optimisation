@@ -44,7 +44,54 @@ except Exception:  # pragma: no cover - profiler is optional
     def _mem_note(msg):
         pass
 
-DATA_FOLDER = "Data_01_04_2026"
+def get_latest_data_folder(base_dir: str = ".") -> str:
+    """Return the most recent ``Data_DD_MM_YYYY`` folder by the date in its name.
+
+    Scans ``base_dir`` for directories named ``Data_<DD>_<MM>_<YYYY>`` and
+    returns the name of the one with the latest parsed calendar date. Folders
+    whose name does not parse to a valid date are ignored.
+
+    Args:
+        base_dir: Directory to scan (defaults to the current working directory,
+            i.e. the workspace root from which the pipeline is run).
+
+    Returns:
+        The folder name of the most recent data folder (e.g. ``"Data_16_06_2026"``).
+
+    Raises:
+        FileNotFoundError: If no valid ``Data_DD_MM_YYYY`` folder is found.
+    """
+    import os
+    import re
+    from datetime import datetime as _datetime
+
+    pattern = re.compile(r"^Data_(\d{2})_(\d{2})_(\d{4})$")
+    candidates = []
+    for name in os.listdir(base_dir):
+        if not os.path.isdir(os.path.join(base_dir, name)):
+            continue
+        match = pattern.match(name)
+        if not match:
+            continue
+        day, month, year = (int(x) for x in match.groups())
+        try:
+            candidates.append((_datetime(year, month, day), name))
+        except ValueError:
+            # Name matches the shape but is not a real date (e.g. month 13).
+            continue
+
+    if not candidates:
+        raise FileNotFoundError(
+            "No 'Data_DD_MM_YYYY' folders found in "
+            f"{os.path.abspath(base_dir)!r}."
+        )
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+# Default to the most recent data folder; pass an explicit `data_folder` to
+# `main()` to override.
+DATA_FOLDER = get_latest_data_folder()
 
 def _downcast_floats(
     df: pd.DataFrame

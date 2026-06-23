@@ -7,8 +7,11 @@ import csv
 import os
 from datetime import datetime
 from model_inference import back_test
+from feature_derivation import get_latest_data_folder
 
-DATA_FOLDER = "Data_05_03_2026"
+# Default to the most recent data folder; pass an explicit `data_folder` to
+# `run_hyperparameter_tuning` to override.
+DATA_FOLDER = get_latest_data_folder()
 
 # ---------------------------------------------------------------------------
 # Metric computation

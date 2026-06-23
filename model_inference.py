@@ -9,8 +9,11 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from data_extraction import reconcile_trading212_to_sharadar
+from feature_derivation import get_latest_data_folder
 
-DATA_FOLDER = "Data_01_04_2026"
+# Default to the most recent data folder; pass an explicit `data_folder` to
+# override on any function that accepts it.
+DATA_FOLDER = get_latest_data_folder()
 
 def build_predictions_and_metrics(
     model: XGBRegressor,
